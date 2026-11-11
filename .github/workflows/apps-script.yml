@@ -1,0 +1,109 @@
+name: Apps Script upload
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Check access, upload editor code, or upload and update the existing web app
+        type: choice
+        default: check
+        options:
+          - check
+          - upload
+          - redeploy
+      backup_confirmed:
+        description: I have backed up the existing Apps Script source and approve replacing it
+        type: boolean
+        default: false
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: apps-script-production
+  cancel-in-progress: false
+
+jobs:
+  apps-script:
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      ((github.event_name == 'push' && vars.APPS_SCRIPT_AUTO_UPLOAD == 'true') ||
+       (github.event_name == 'workflow_dispatch' &&
+        (inputs.operation == 'check' || inputs.backup_confirmed)))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
+      - name: Install clasp
+        run: npm install --global @google/clasp@3.4.1
+      - name: Check access or upload approved source
+        shell: bash
+        env:
+          OPERATION: ${{ inputs.operation || 'upload' }}
+          SCRIPT_ID: ${{ secrets.APPS_SCRIPT_ID }}
+          CLASP_CREDENTIALS: ${{ secrets.CLASP_CREDENTIALS }}
+          DEPLOYMENT_ID: ${{ secrets.APPS_SCRIPT_DEPLOYMENT_ID }}
+        run: |
+          if [[ -z "$SCRIPT_ID" || -z "$CLASP_CREDENTIALS" ]]; then
+            echo "::error::Set APPS_SCRIPT_ID and CLASP_CREDENTIALS in Actions secrets."
+            exit 1
+          fi
+          if [[ "$OPERATION" == redeploy && -z "$DEPLOYMENT_ID" ]]; then
+            echo "::error::Set APPS_SCRIPT_DEPLOYMENT_ID before choosing redeploy."
+            exit 1
+          fi
+          if [[ "$OPERATION" != check ]]; then
+            if [[ ! -s src/appsscript.json ]] ||
+               [[ -z "$(find src -type f \( -name '*.gs' -o -name '*.js' \) ! -path '*/.*' -print -quit)" ]]; then
+              echo "::error::Add the complete reviewed Apps Script source and manifest to src/."
+              exit 1
+            fi
+            node -e "JSON.parse(require('node:fs').readFileSync('src/appsscript.json', 'utf8'))"
+          fi
+
+          umask 077
+          auth_dir="$(mktemp -d)"
+          trap 'rm -rf -- "$auth_dir"' EXIT
+          export HOME="$auth_dir"
+          printf '%s' "$CLASP_CREDENTIALS" > "$HOME/.clasprc.json"
+          unset CLASP_CREDENTIALS
+
+          # Keep Google API errors and project details out of the public log.
+          run_clasp() {
+            local error_message="$1"
+            shift
+            if ! clasp --user github-actions "$@" >/dev/null 2>&1; then
+              echo "::error::$error_message"
+              return 1
+            fi
+          }
+
+          if [[ "$OPERATION" == check ]]; then
+            cd "$auth_dir"
+            run_clasp "Could not read the project. Check Google authorization, API access and script ID." clone-script "$SCRIPT_ID"
+            echo "Read access to the Apps Script source verified."
+            exit 0
+          fi
+
+          node -e "require('node:fs').writeFileSync('.clasp.json', JSON.stringify({scriptId: process.env.SCRIPT_ID, rootDir: 'src'}))"
+          if [[ "$OPERATION" == redeploy ]]; then
+            if ! clasp --user github-actions list-deployments 2>/dev/null | grep -F -- "$DEPLOYMENT_ID" >/dev/null; then
+              echo "::error::Could not find the specified deployment in this project."
+              exit 1
+            fi
+          fi
+          run_clasp "Source upload failed. Check Google write access and the source files." push --force
+          echo "Apps Script editor source uploaded."
+          if [[ "$OPERATION" == redeploy ]]; then
+            run_clasp "Editor source was uploaded, but deployment update failed. Check deployment ownership and settings." update-deployment "$DEPLOYMENT_ID" --description "GitHub ${GITHUB_SHA}"
+            echo "Existing web app deployment updated."
+          fi
