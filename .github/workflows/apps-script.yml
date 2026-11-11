@@ -73,15 +73,15 @@ jobs:
           umask 077
           auth_dir="$(mktemp -d)"
           trap 'rm -rf -- "$auth_dir"' EXIT
-          export HOME="$auth_dir"
-          printf '%s' "$CLASP_CREDENTIALS" > "$HOME/.clasprc.json"
+          auth_file="$auth_dir/.clasprc.json"
+          printf '%s' "$CLASP_CREDENTIALS" > "$auth_file"
           unset CLASP_CREDENTIALS
 
           # Keep Google API errors and project details out of the public log.
           run_clasp() {
             local error_message="$1"
             shift
-            if ! clasp --user github-actions "$@" >/dev/null 2>&1; then
+            if ! clasp --auth "$auth_file" --user github-actions "$@" >/dev/null 2>&1; then
               echo "::error::$error_message"
               return 1
             fi
@@ -96,7 +96,8 @@ jobs:
 
           node -e "require('node:fs').writeFileSync('.clasp.json', JSON.stringify({scriptId: process.env.SCRIPT_ID, rootDir: 'src'}))"
           if [[ "$OPERATION" == redeploy ]]; then
-            if ! clasp --user github-actions list-deployments 2>/dev/null | grep -F -- "$DEPLOYMENT_ID" >/dev/null; then
+            if ! clasp --auth "$auth_file" --user github-actions --json list-deployments 2>/dev/null |\
+                node -e 'const deployments = JSON.parse(require("node:fs").readFileSync(0, "utf8")); process.exit(deployments.some(d => d.deploymentId === process.env.DEPLOYMENT_ID && d.versionNumber > 0) ? 0 : 1)' >/dev/null 2>&1; then
               echo "::error::Could not find the specified deployment in this project."
               exit 1
             fi
